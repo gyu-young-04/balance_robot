@@ -1,0 +1,296 @@
+#include "M5Unified.h"
+#include "M5Module4EncoderMotor.h"
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
+
+M5Module4EncoderMotor driver;
+
+// ======================
+// Motor
+// ======================
+#define LEFT_MOTOR  2
+#define RIGHT_MOTOR 3
+
+#define LEFT_DIR     (1)
+#define RIGHT_DIR    (-1)
+
+#define LEFT_ENC_DIR  (1)
+#define RIGHT_ENC_DIR (1)
+
+// ======================
+// PID 밸런싱 파라미터
+// ======================
+float Kp = 11.0;
+float Ki = 0.1;
+float Kd = 0.6;
+float Ks = -0.20;
+
+#define PWM_LIMIT 55
+
+// 무게중심 전방 쏠림 방지를 위한 타겟 각도 (3.0 안정값 유지)
+float target = 2.05;
+
+// 타 태스크 간 데이터 동기화를 위한 전역 변수
+volatile float g_pitch = 0;
+volatile int   g_pwm   = 0;
+volatile float g_speed = 0;
+volatile int   g_steering = 0;
+
+float left_trim  = 1.05;
+float right_trim = 1.0;
+
+// ======================
+// Color Sensor (PORT C 리맵핑 적용)
+// ======================
+#define SENSOR_SDA 17
+#define SENSOR_SCL 18
+
+TwoWire ColorWire = TwoWire(0);
+
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(
+    TCS34725_INTEGRATIONTIME_50MS,
+    TCS34725_GAIN_4X
+);
+
+String g_color = "NONE";
+
+float WB_R = 2.325f;
+float WB_G = 1.00f;
+float WB_B = 0.727f;
+
+// ===================================================
+// Color Classification
+// ===================================================
+String getColorName(uint8_t r, uint8_t g, uint8_t b, uint16_t c_raw) {
+  float rf = r / 255.0f;
+  float gf = g / 255.0f;
+  float bf = b / 255.0f;
+
+  float maxC  = max(rf, max(gf, bf));
+  float minC  = min(rf, min(gf, bf));
+  float delta = maxC - minC;
+
+  float s = (maxC > 0) ? delta / maxC : 0;
+  float v = maxC;
+
+  if (c_raw < 150) return "BLACK";
+  if (v < 0.20f)   return "BLACK";
+  if (s < 0.03f)   return "WHITE";
+  if (s < 0.10f)   return "GRAY";
+
+  float h = 0;
+  if (delta > 0) {
+    if      (maxC == rf) h = 60.0f * fmod((gf - bf) / delta, 6.0f);
+    else if (maxC == gf) h = 60.0f * ((bf - rf) / delta + 2.0f);
+    else                 h = 60.0f * ((rf - gf) / delta + 4.0f);
+
+    if (h < 0) h += 360.0f;
+  }
+
+  if      (h < 20 || h >= 340) return (s < 0.50f) ? "PINK" : "RED";
+  else if (h < 85)             return "YELLOW";
+  else if (h < 150)            return "GREEN";
+  else if (h < 200)            return "CYAN";
+  else if (h < 265)            return "BLUE";
+  else if (h < 295)            return "PURPLE";
+  else                         return (s < 0.50f) ? "PINK" : "PURPLE";
+}
+
+// ===================================================
+// PID TASK (Core 1 - 제어 주기 5ms 완벽 독점)
+// ===================================================
+void PIDtask(void* pv)
+{
+    float pitch = 0;
+    float integral = 0;
+
+    int32_t prevEncL = 0;
+    int32_t prevEncR = 0;
+
+    unsigned long lastTime = micros();
+    static float filtered_speed = 0;
+
+    while (1)
+    {
+        unsigned long now = micros();
+        float dt = (now - lastTime) / 1000000.0f;
+        lastTime = now;
+
+        if (dt <= 0 || dt > 0.05)
+        {
+            vTaskDelay(1);
+            continue;
+        }
+
+        float ax, ay, az;
+        float gx, gy, gz;
+
+        M5.Imu.getAccel(&ax, &ay, &az);
+        M5.Imu.getGyro(&gx, &gy, &gz);
+
+        float pitchAcc = atan2(az, -ax) * 180.0f / PI;
+        pitch = 0.985f * (pitch + (-gy) * dt) + 0.015f * pitchAcc;
+
+        int32_t encL = LEFT_ENC_DIR * driver.getEncoderValue(LEFT_MOTOR);
+        int32_t encR = RIGHT_ENC_DIR * driver.getEncoderValue(RIGHT_MOTOR);
+
+        float raw_speed = ((encL - prevEncL) + (encR - prevEncR)) / 2.0f / dt;
+        prevEncL = encL;
+        prevEncR = encR;
+
+        filtered_speed = 0.8f * filtered_speed + 0.2f * raw_speed;
+
+        float error = pitch - target;
+        integral += error * dt;
+        integral = constrain(integral, -5, 5);
+
+        float pwm_f = (-Kp * error) + (-Ki * integral) + (Kd * gy) + (-Ks * filtered_speed);
+
+        int motor_pwm = 0;
+        if (abs(pwm_f) > 0.5f)
+        {
+            motor_pwm = (pwm_f > 0) ? (int)pwm_f + 3 : (int)pwm_f - 3;
+        }
+
+        // 코너링 시 속도 감쇄 알고리즘 (감쇄 계수 0.3f 완화 적용 유지)
+        int de_steer = (int)(abs(g_steering) * 0.3f);
+        motor_pwm = (motor_pwm > 0) ? (motor_pwm - de_steer) : (motor_pwm + de_steer);
+
+        motor_pwm = constrain(motor_pwm, -PWM_LIMIT, PWM_LIMIT);
+
+        if (abs(pitch) > 45)
+        {
+            motor_pwm = 0;
+            integral = 0;
+        }
+
+        int leftOut  = motor_pwm + g_steering;
+        int rightOut = motor_pwm - g_steering;
+
+        leftOut  = constrain(leftOut, -PWM_LIMIT, PWM_LIMIT);
+        rightOut = constrain(rightOut, -PWM_LIMIT, PWM_LIMIT);
+
+        driver.setMotorSpeed(LEFT_MOTOR, LEFT_DIR * leftOut * left_trim);
+        driver.setMotorSpeed(RIGHT_MOTOR, RIGHT_DIR * rightOut * right_trim);
+
+        g_pitch = pitch;
+        g_pwm   = motor_pwm;
+        g_speed = filtered_speed;
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+// ===================================================
+// SETUP
+// ===================================================
+void setup()
+{
+    auto cfg = M5.config();
+    M5.begin(cfg);
+    Serial.begin(115200);
+    M5.Imu.begin();
+
+    Wire1.setClock(400000);
+    if (!driver.begin(&Wire1, MODULE_4ENCODERMOTOR_ADDR, 11, 12))
+    {
+        Serial.println("Motor Module Error");
+        while (1);
+    }
+
+    driver.setMode(LEFT_MOTOR, NORMAL_MODE);
+    driver.setMode(RIGHT_MOTOR, NORMAL_MODE);
+
+    ColorWire.begin(SENSOR_SDA, SENSOR_SCL, 100000);
+
+    M5.Power.setExtOutput(true);
+    delay(200);
+
+    if (!tcs.begin(TCS34725_ADDRESS, &ColorWire))
+    {
+        Serial.println("Color Sensor NOT FOUND");
+    }
+    else
+    {
+        Serial.println("Color Sensor OK");
+    }
+
+    xTaskCreatePinnedToCore(PIDtask, "PIDtask", 4096, NULL, 5, NULL, 1);
+}
+
+// ===================================================
+// LOOP (Core 0 - 라인 트레이싱 PD 연산 및 센싱)
+// ===================================================
+void loop()
+{
+    static uint32_t lastColor = 0;
+    static uint32_t lastPrint = 0;
+    
+    // 🛠️ [PD 제어용 설정 파라미터]
+    const float LINE_SETPOINT = 180.0f;  // 흑/백 경계면 실측 c_raw 중간값
+    const float KP_LINE       = 0.12f;   // 비례 제어 이득 (초기값)
+    const float KD_LINE       = 0.07f;   // 미분 제어 이득 (초기값)
+    const int   MAX_STEER     = 22;      // 밸런싱 보존을 위한 최대 조향치 제한
+
+    static float prev_error = 0;
+
+    // 1. 20ms 주기로 오차 기반 PD 라인트레이싱 연산
+    if (millis() - lastColor > 20)
+    {
+        lastColor = millis();
+
+        uint16_t r_raw, g_raw, b_raw, c_raw;
+        tcs.getRawData(&r_raw, &g_raw, &b_raw, &c_raw);
+
+        // 현재 값과 목표 경계면 값과의 오차 계산
+        float error = (float)c_raw - LINE_SETPOINT;
+        float d_error = error - prev_error;
+        prev_error = error;
+
+        // PD 조향 출력 연산
+        int target_steer = (int)(KP_LINE * error + KD_LINE * d_error);
+        
+        // 조향 최대값 구조적 홀딩 제한
+        target_steer = constrain(target_steer, -MAX_STEER, MAX_STEER);
+
+        // 🛠️ 차체 기울어짐(Pitch) 과도 시 조향 안정화 필터 구현
+        // 급커브 진입 시 원심력 등으로 차체가 흔들릴 때 순간 조향 입력을 감쇄해 복원 토크를 돕습니다.
+        if(abs(g_pitch) > 15)
+    {
+    target_steer = target_steer * 0.7;
+    }
+
+        // 반응 지연을 완전히 없애기 위해 램프 필터(Smoothing)를 거치지 않고 실시간 전역 공유
+        g_steering = target_steer;
+
+        // 디버그용 컬러 이름 분류 루틴 유지
+        float r_wb = r_raw * WB_R;
+        float g_wb = g_raw * WB_G;
+        float b_wb = b_raw * WB_B;
+        float maxWB = max(r_wb, max(g_wb, b_wb));
+
+        uint8_t rc = 0, gc = 0, bc = 0;
+        if (maxWB > 0)
+        {
+            rc = min(255, (int)(r_wb * 255.0f / maxWB));
+            gc = min(255, (int)(g_wb * 255.0f / maxWB));
+            bc = min(255, (int)(b_wb * 255.0f / maxWB));
+        }
+        g_color = getColorName(rc, gc, bc, c_raw);
+    }
+
+    // 2. 200ms 주기로 시리얼 플로터/디버그 출력
+    if (millis() - lastPrint > 200)
+    {
+        lastPrint = millis();
+        
+        uint16_t r_raw, g_raw, b_raw, c_raw;
+        tcs.getRawData(&r_raw, &g_raw, &b_raw, &c_raw);
+
+        Serial.printf("C:%4d | Pitch:%6.2f | PWM:%4d | Steer:%3d\n",
+                      c_raw, g_pitch, g_pwm, g_steering);
+    }
+
+    delay(1);
+}
+
