@@ -1,0 +1,493 @@
+#include <M5Unified.h>
+#include <MicroTFLite.h>
+#include "esp_camera.h"
+#include "model_data.h"
+
+const int CANVAS_SIZE = 160;
+const int MODEL_INPUT_SIZE = 28;
+const int ARENA_SIZE = 96 * 1024;
+
+alignas(16) uint8_t tensor_arena[ARENA_SIZE];
+
+M5Canvas canvas(&M5.Display);
+
+bool isCameraMode = false;
+bool drawing = false;
+
+int lastX = -1;
+int lastY = -1;
+
+void runInference();
+void preprocessTouch();
+
+// =========================================
+// 부드러운 브러시
+// =========================================
+void drawBrush(int cx, int cy) {
+
+    for (int by = -5; by <= 5; by++) {
+
+        for (int bx = -5; bx <= 5; bx++) {
+
+            float dist = sqrtf(bx * bx + by * by);
+
+            if (dist <= 5.0f) {
+
+                int px = cx + bx;
+                int py = cy + by;
+
+                if (px >= 0 && px < CANVAS_SIZE &&
+                    py >= 0 && py < CANVAS_SIZE) {
+
+                    uint16_t existing =
+                        canvas.readPixel(px, py);
+
+                    uint8_t existingBright =
+                        (existing >> 8) & 0xF8;
+
+                    uint8_t newBright =
+                        (uint8_t)(255.0f *
+                        (1.0f - dist / 5.0f));
+
+                    uint8_t finalBright =
+                        max(existingBright, newBright);
+
+                    canvas.drawPixel(
+                        px,
+                        py,
+                        canvas.color565(
+                            finalBright,
+                            finalBright,
+                            finalBright
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+void setup() {
+
+    auto cfg = M5.config();
+    cfg.internal_imu = true;
+
+    M5.begin(cfg);
+
+    Serial.begin(115200);
+
+    delay(500);
+
+    if (!ModelInit(
+            model_tflite,
+            tensor_arena,
+            ARENA_SIZE)) {
+
+        Serial.println("❌ Model Init Failed!");
+
+        while (1);
+    }
+
+    Serial.println("✅ Model Init Success!");
+
+    M5.Display.setRotation(1);
+
+    M5.Display.fillScreen(BLACK);
+
+    canvas.createSprite(
+        CANVAS_SIZE,
+        CANVAS_SIZE
+    );
+
+    canvas.fillSprite(BLACK);
+
+    canvas.pushSprite(80, 40);
+
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setTextDatum(middle_center);
+
+    M5.Display.drawString(
+        "Draw Number",
+        160,
+        20
+    );
+
+    M5.Display.drawString(
+        "A: Mode   C: Clear",
+        160,
+        225
+    );
+}
+
+void loop() {
+
+    M5.update();
+
+    auto detail = M5.Touch.getDetail();
+
+    bool isBottomTouched =
+        detail.isPressed() &&
+        (detail.y > 200);
+
+    // =========================================
+    // MODE TOGGLE
+    // =========================================
+    if (M5.BtnA.wasPressed() ||
+        (isBottomTouched && detail.x < 100)) {
+
+        isCameraMode = !isCameraMode;
+
+        M5.Display.fillScreen(BLACK);
+
+        M5.Display.setCursor(10, 10);
+
+        M5.Display.printf(
+            "MODE: %s",
+            isCameraMode ? "CAMERA" : "TOUCH"
+        );
+
+        if (!isCameraMode) {
+            canvas.pushSprite(80, 40);
+        }
+
+        delay(200);
+
+        return;
+    }
+
+    // =========================================
+    // CLEAR
+    // =========================================
+    if (M5.BtnC.wasPressed() ||
+        (isBottomTouched && detail.x > 220)) {
+
+        canvas.fillSprite(BLACK);
+
+        canvas.pushSprite(80, 40);
+
+        M5.Display.fillRect(
+            0,
+            190,
+            320,
+            50,
+            BLACK
+        );
+
+        lastX = -1;
+        lastY = -1;
+
+        Serial.println(">>> Canvas Cleared");
+
+        delay(200);
+
+        return;
+    }
+
+    // =========================================
+    // TOUCH DRAW
+    // =========================================
+    if (!isCameraMode) {
+
+        if (detail.isPressed() &&
+            detail.y < 200) {
+
+            drawing = true;
+
+            int tx = detail.x - 80;
+            int ty = detail.y - 40;
+
+            if (tx >= 0 && tx < CANVAS_SIZE &&
+                ty >= 0 && ty < CANVAS_SIZE) {
+
+                // =====================================
+                // INTERPOLATION
+                // =====================================
+                if (lastX >= 0 && lastY >= 0) {
+
+                    int dx = tx - lastX;
+                    int dy = ty - lastY;
+
+                    int steps =
+                        max(abs(dx), abs(dy));
+
+                    if (steps < 1) {
+                        steps = 1;
+                    }
+
+                    for (int i = 0; i <= steps; i++) {
+
+                        float t =
+                            (float)i / steps;
+
+                        int ix =
+                            lastX + dx * t;
+
+                        int iy =
+                            lastY + dy * t;
+
+                        drawBrush(ix, iy);
+                    }
+
+                } else {
+
+                    drawBrush(tx, ty);
+                }
+
+                lastX = tx;
+                lastY = ty;
+
+                canvas.pushSprite(80, 40);
+            }
+        }
+
+        // =========================================
+        // RELEASE
+        // =========================================
+        if (!detail.isPressed() &&
+            drawing) {
+
+            drawing = false;
+
+            lastX = -1;
+            lastY = -1;
+
+            preprocessTouch();
+
+            runInference();
+        }
+    }
+}
+
+void preprocessTouch() {
+
+    Serial.println(
+        "\n--- Input Tensor Visual (28x28) ---"
+    );
+
+    float raw[28][28];
+
+    float blockSize =
+        (float)CANVAS_SIZE / 28.0f;
+
+    // =========================================
+    // DOWNSAMPLE (MAX POOLING)
+    // =========================================
+    for (int y = 0; y < 28; y++) {
+
+        for (int x = 0; x < 28; x++) {
+
+            int x0 = (int)(x * blockSize);
+            int y0 = (int)(y * blockSize);
+
+            int x1 = (int)((x + 1) * blockSize);
+            int y1 = (int)((y + 1) * blockSize);
+
+            float maxBright = 0.0f;
+
+            for (int sy = y0; sy < y1; sy++) {
+
+                for (int sx = x0; sx < x1; sx++) {
+
+                    uint16_t color =
+                        canvas.readPixel(sx, sy);
+
+                    uint8_t r =
+                        (color >> 11) & 0x1F;
+
+                    uint8_t g =
+                        (color >> 5) & 0x3F;
+
+                    uint8_t b =
+                        color & 0x1F;
+
+                    float bright =
+                        ((float)r / 31.0f +
+                         (float)g / 63.0f +
+                         (float)b / 31.0f) / 3.0f;
+
+                    if (bright > maxBright) {
+                        maxBright = bright;
+                    }
+                }
+            }
+
+            raw[y][x] = maxBright;
+        }
+    }
+
+    // =========================================
+    // BOUNDING BOX
+    // =========================================
+    int minX = 28;
+    int minY = 28;
+
+    int maxX = 0;
+    int maxY = 0;
+
+    for (int y = 0; y < 28; y++) {
+
+        for (int x = 0; x < 28; x++) {
+
+            if (raw[y][x] > 0.18f) {
+
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+
+    // =========================================
+    // 빈 입력 처리
+    // =========================================
+    if (maxX <= minX ||
+        maxY <= minY) {
+
+        for (int i = 0; i < 28 * 28; i++) {
+            ModelSetInput(0.0f, i);
+        }
+
+        Serial.println("No Drawing");
+
+        return;
+    }
+
+    // =========================================
+    // NORMALIZATION
+    // =========================================
+    float normalized[28][28] = {0};
+
+    int boxW = maxX - minX + 1;
+    int boxH = maxY - minY + 1;
+
+    float scale =
+        20.0f / max(boxW, boxH);
+
+    int scaledW =
+        (int)(boxW * scale);
+
+    int scaledH =
+        (int)(boxH * scale);
+
+    int offsetX =
+        (28 - scaledW) / 2;
+
+    int offsetY =
+        (28 - scaledH) / 2;
+
+    for (int y = 0; y < scaledH; y++) {
+
+        for (int x = 0; x < scaledW; x++) {
+
+            int srcX =
+                minX + (int)(x / scale);
+
+            int srcY =
+                minY + (int)(y / scale);
+
+            if (srcX >= 0 && srcX < 28 &&
+                srcY >= 0 && srcY < 28) {
+
+                normalized[y + offsetY]
+                          [x + offsetX] =
+                    raw[srcY][srcX];
+            }
+        }
+    }
+
+    // =========================================
+    // MODEL INPUT
+    // =========================================
+    for (int y = 0; y < 28; y++) {
+
+        for (int x = 0; x < 28; x++) {
+
+            float pixelValue =
+                normalized[y][x];
+
+            ModelSetInput(
+                pixelValue,
+                y * 28 + x
+            );
+
+            Serial.print(
+                pixelValue > 0.18f
+                ? "O"
+                : "."
+            );
+        }
+
+        Serial.println();
+    }
+}
+
+void runInference() {
+
+    if (!ModelRunInference()) {
+
+        Serial.println(
+            "Inference Failed!"
+        );
+
+        return;
+    }
+
+    float max_score = -1.0f;
+
+    int prediction = -1;
+
+    for (int i = 0; i < 10; i++) {
+
+        float score =
+            ModelGetOutput(i);
+
+        Serial.printf(
+            "%d : %.5f\n",
+            i,
+            score
+        );
+
+        if (score > max_score) {
+
+            max_score = score;
+
+            prediction = i;
+        }
+    }
+
+    M5.Display.fillRect(
+        0,
+        190,
+        320,
+        40,
+        BLACK
+    );
+
+    M5.Display.setTextColor(YELLOW);
+    M5.Display.setTextSize(2);
+
+    M5.Display.setCursor(60, 200);
+
+    if (max_score > 0.1f) {
+
+        M5.Display.printf(
+            "DETECT: %d (%d%%)",
+            prediction,
+            (int)(max_score * 100)
+        );
+
+        Serial.printf(
+            "\n>>> Predicted: %d  confidence: %.5f\n",
+            prediction,
+            max_score
+        );
+
+    } else {
+
+        M5.Display.printf(
+            "DETECT: ?"
+        );
+    }
+}
